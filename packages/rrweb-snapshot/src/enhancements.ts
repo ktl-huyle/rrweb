@@ -13,11 +13,11 @@ export type SnapshotEnhancements = {
 
 const defaultSnapshotEnhancements: SnapshotEnhancements = {
   cssImages: {
-    enabled: true,
-    maxBytesPerImage: 640 * 1024,
-    maxTotalBytes: 2560 * 1024,
+    enabled: false,
+    maxBytesPerImage: 1024 * 1024,
+    maxTotalBytes: 4096 * 1024,
     fetchTimeoutMs: 2000,
-    followupSnapshotTimeoutMs: 2500,
+    followupSnapshotTimeoutMs: 3000,
     log: false,
   },
 };
