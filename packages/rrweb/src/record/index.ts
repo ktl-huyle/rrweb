@@ -46,6 +46,8 @@ let wrappedEmit!: (e: eventWithoutTime, isCheckout?: boolean) => void;
 let takeFullSnapshot!: (isCheckout?: boolean) => void;
 let canvasManager!: CanvasManager;
 let recording = false;
+const CSS_INLINE_FOLLOWUP_TIMEOUT = 2500;
+let cssInlineCheckoutInFlight = false;
 
 // Multiple tools (i.e. MooTools, Prototype.js) override Array.from and drop support for the 2nd parameter
 // Try to pull a clean implementation from a newly created iframe
@@ -338,6 +340,7 @@ function record<T = eventWithTime>(
     if (!recordDOM) {
       return;
     }
+    const cssImageInlineCallbacks: Promise<boolean>[] = [];
     wrappedEmit(
       {
         type: EventType.Meta,
@@ -370,6 +373,7 @@ function record<T = eventWithTime>(
       dataURLOptions,
       recordCanvas,
       inlineImages,
+      cssImageInlineCallbacks,
       onSerialize: (n) => {
         if (isSerializedIframe(n, mirror)) {
           iframeManager.addIframe(n as HTMLIFrameElement);
@@ -405,7 +409,7 @@ function record<T = eventWithTime>(
         },
       },
       isCheckout,
-    );
+      );
     mutationBuffers.forEach((buf) => buf.unlock()); // generate & emit any mutations that happened during snapshotting, as can now apply against the newly built mirror
 
     // Some old browsers don't support adoptedStyleSheets.
@@ -414,6 +418,33 @@ function record<T = eventWithTime>(
         document.adoptedStyleSheets,
         mirror.getId(document),
       );
+
+    if (
+      inlineStylesheet &&
+      !isCheckout &&
+      cssImageInlineCallbacks.length &&
+      !cssInlineCheckoutInFlight
+    ) {
+      cssInlineCheckoutInFlight = true;
+      const callbacks = [...cssImageInlineCallbacks];
+      const timeoutPromise = new Promise<boolean>((resolve) =>
+        setTimeout(() => resolve(false), CSS_INLINE_FOLLOWUP_TIMEOUT),
+      );
+      Promise.race([
+        Promise.allSettled(callbacks).then((results) =>
+          results.some((r) => r.status === 'fulfilled' && r.value),
+        ),
+        timeoutPromise,
+      ])
+        .then((inlined) => {
+          if (inlined) {
+            takeFullSnapshot(true);
+          }
+        })
+        .finally(() => {
+          cssInlineCheckoutInFlight = false;
+        });
+    }
   };
 
   try {
