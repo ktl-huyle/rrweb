@@ -29,15 +29,18 @@ function minifyAndUMDPlugin({
       for (const file of Object.values(bundle)) {
         if (
           file.type === 'asset' &&
-          (file.fileName.endsWith('.cjs.map') || file.fileName.endsWith('.css'))
+          (file.fileName.endsWith('.cjs.map') || 
+           file.fileName.endsWith('.js.map') || 
+           file.fileName.endsWith('.css'))
         ) {
           const isCSS = file.fileName.endsWith('.css');
+          const isESM = file.fileName.endsWith('.js.map');
           const inputFilePath = resolve(
             outputOptions.dir!,
             file.fileName,
           ).replace(/\.map$/, '');
           const baseFileName = file.fileName.replace(
-            /(\.cjs|\.css)(\.map)?$/,
+            /(\.cjs|\.js|\.css)(\.map)?$/,
             '',
           );
           const outputFilePath = resolve(outputOptions.dir!, baseFileName);
@@ -50,13 +53,26 @@ function minifyAndUMDPlugin({
               isCss: true,
               outDir,
             });
+          } else if (isESM) {
+            // Minify ES module
+            await buildFile({
+              name,
+              input: inputFilePath,
+              output: `${outputFilePath}.min.js`,
+              minify: true,
+              isCss: false,
+              isESM: true,
+              outDir,
+            });
           } else {
+            // UMD format
             await buildFile({
               name,
               input: inputFilePath,
               output: `${outputFilePath}.umd.cjs`,
               minify: false,
               isCss: false,
+              isESM: false,
               outDir,
             });
             await buildFile({
@@ -65,6 +81,7 @@ function minifyAndUMDPlugin({
               output: `${outputFilePath}.umd.min.cjs`,
               minify: true,
               isCss: false,
+              isESM: false,
               outDir,
             });
           }
@@ -80,6 +97,7 @@ async function buildFile({
   output,
   minify,
   isCss,
+  isESM,
   outDir,
 }: {
   name?: LibraryOptions['name'];
@@ -88,16 +106,17 @@ async function buildFile({
   outDir: string;
   minify: boolean;
   isCss: boolean;
+  isESM?: boolean;
 }) {
   await build({
     entryPoints: [input],
     outfile: output,
     minify,
     sourcemap: true,
-    format: isCss ? undefined : ('umd' as Format),
+    format: isCss ? undefined : (isESM ? 'esm' : 'umd') as Format,
     target: isCss ? undefined : 'es2017',
     treeShaking: !isCss,
-    plugins: [
+    plugins: isESM ? [] : [
       umdWrapper({
         libraryName: name,
       }),
