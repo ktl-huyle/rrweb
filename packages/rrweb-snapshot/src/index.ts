@@ -15,6 +15,12 @@ import rebuild, {
   adaptCssForReplay,
   createCache,
 } from './rebuild';
+export type { SnapshotEnhancements, CssImagesConfig } from './enhancements';
+export {
+  configureSnapshotEnhancements,
+  getSnapshotEnhancements,
+  resetSnapshotEnhancements,
+} from './enhancements';
 export * from './types';
 export * from './utils';
 

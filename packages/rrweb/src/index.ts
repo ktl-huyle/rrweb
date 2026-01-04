@@ -1,4 +1,4 @@
-import record from './record';
+import record, { configureRecorderEnhancements } from './record';
 import {
   Replayer,
   type playerConfig,
@@ -28,6 +28,7 @@ const { takeFullSnapshot } = record;
 
 export {
   record,
+  configureRecorderEnhancements,
   addCustomEvent,
   freezePage,
   takeFullSnapshot,

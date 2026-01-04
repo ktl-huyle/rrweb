@@ -31,6 +31,10 @@ import {
   absolutifyURLs,
   markCssSplits,
 } from './utils';
+import {
+  getSnapshotEnhancements,
+  type CssImagesConfig,
+} from './enhancements';
 import dom from '@rrweb/utils';
 
 let _id = 1;
@@ -69,9 +73,6 @@ const SRCSET_COMMAS_OR_SPACES = /^[, \t\n\r\u000c]+/;
 const CSS_URL_REGEX = /url\(\s*(?:'([^']+)'|"([^"]+)"|([^'")\s]+))\s*\)/gi;
 const CSS_IMAGE_DECL_REGEX =
   /(background(?:-image)?|border-image(?:-source)?|list-style(?:-image)?|content)\s*:\s*([^;{}]*url\([^;{}]*\))/gi;
-const CSS_IMAGE_INLINE_MAX_BYTES = 640 * 1024; // per image cap
-const CSS_IMAGE_INLINE_TOTAL_BYTES = 2560 * 1024; // per snapshot cap
-const CSS_IMAGE_INLINE_TIMEOUT = 2000; // ms
 const cssImageInlineCache = new Map<string, string>();
 function getAbsoluteSrcsetString(doc: Document, attributeValue: string) {
   /*
@@ -215,6 +216,8 @@ function inlineCssImageUrls(
   doc: Document,
   onInline: (updatedCss: string) => void,
 ): Promise<boolean> | null {
+  const cssConfig: CssImagesConfig = getSnapshotEnhancements().cssImages;
+  if (!cssConfig.enabled) return null;
   const fetchImpl =
     doc.defaultView?.fetch || (typeof fetch === 'function' ? fetch : null);
   const btoaImpl =
@@ -239,7 +242,7 @@ function inlineCssImageUrls(
 
   return (async () => {
     for (const match of normalizedMatches) {
-      if (totalBytes >= CSS_IMAGE_INLINE_TOTAL_BYTES) break;
+      if (totalBytes >= cssConfig.maxTotalBytes) break;
       const cached = cssImageInlineCache.get(match.url);
       if (cached) {
         replacements.push({ ...match, dataUrl: cached });
@@ -249,7 +252,7 @@ function inlineCssImageUrls(
       const controller =
         typeof AbortController !== 'undefined' ? new AbortController() : null;
       const timeoutId = controller
-        ? setTimeout(() => controller.abort(), CSS_IMAGE_INLINE_TIMEOUT)
+        ? setTimeout(() => controller.abort(), cssConfig.fetchTimeoutMs)
         : null;
       try {
         const response = await fetchImpl(match.url, {
@@ -264,15 +267,15 @@ function inlineCssImageUrls(
         const parsedLength = declaredLength ? parseInt(declaredLength, 10) : 0;
         if (
           parsedLength &&
-          (parsedLength > CSS_IMAGE_INLINE_MAX_BYTES ||
-            totalBytes + parsedLength > CSS_IMAGE_INLINE_TOTAL_BYTES)
+          (parsedLength > cssConfig.maxBytesPerImage ||
+            totalBytes + parsedLength > cssConfig.maxTotalBytes)
         ) {
           continue;
         }
         const buffer = await response.arrayBuffer();
         if (!buffer.byteLength) continue;
-        if (buffer.byteLength > CSS_IMAGE_INLINE_MAX_BYTES) continue;
-        if (totalBytes + buffer.byteLength > CSS_IMAGE_INLINE_TOTAL_BYTES)
+        if (buffer.byteLength > cssConfig.maxBytesPerImage) continue;
+        if (totalBytes + buffer.byteLength > cssConfig.maxTotalBytes)
           break;
 
         const contentType =
@@ -303,7 +306,7 @@ function inlineCssImageUrls(
     }
     result += cssText.slice(cursor);
     if (replacements.length) {
-      if (typeof console !== 'undefined' && console.info) {
+      if (cssConfig.log && typeof console !== 'undefined' && console.info) {
         console.info(
           `[rrweb] inlined ${replacements.length} css image(s) (${totalBytes} bytes)`,
         );

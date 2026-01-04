@@ -3,6 +3,9 @@ import {
   slimDOMDefaults,
   type MaskInputOptions,
   createMirror,
+  configureSnapshotEnhancements,
+  getSnapshotEnhancements,
+  type SnapshotEnhancements,
 } from 'rrweb-snapshot';
 import { initObservers, mutationBuffers } from './observer';
 import {
@@ -46,8 +49,17 @@ let wrappedEmit!: (e: eventWithoutTime, isCheckout?: boolean) => void;
 let takeFullSnapshot!: (isCheckout?: boolean) => void;
 let canvasManager!: CanvasManager;
 let recording = false;
-const CSS_INLINE_FOLLOWUP_TIMEOUT = 2500;
 let cssInlineCheckoutInFlight = false;
+
+export function configureRecorderEnhancements(
+  config: Partial<SnapshotEnhancements>,
+) {
+  (
+    configureSnapshotEnhancements as (
+      cfg: Partial<SnapshotEnhancements>,
+    ) => void
+  )(config);
+}
 
 // Multiple tools (i.e. MooTools, Prototype.js) override Array.from and drop support for the 2nd parameter
 // Try to pull a clean implementation from a newly created iframe
@@ -340,6 +352,11 @@ function record<T = eventWithTime>(
     if (!recordDOM) {
       return;
     }
+    /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call */
+    const enhancements = getSnapshotEnhancements() as SnapshotEnhancements;
+    const cssConfig =
+      enhancements.cssImages as SnapshotEnhancements['cssImages'];
+    /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call */
     const cssImageInlineCallbacks: Promise<boolean>[] = [];
     wrappedEmit(
       {
@@ -427,9 +444,14 @@ function record<T = eventWithTime>(
     ) {
       cssInlineCheckoutInFlight = true;
       const callbacks = [...cssImageInlineCallbacks];
+      /* eslint-disable @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-member-access */
       const timeoutPromise = new Promise<boolean>((resolve) =>
-        setTimeout(() => resolve(false), CSS_INLINE_FOLLOWUP_TIMEOUT),
+        setTimeout(
+          () => resolve(false),
+          cssConfig.followupSnapshotTimeoutMs || 0,
+        ),
       );
+      /* eslint-enable @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-member-access */
       Promise.race([
         Promise.allSettled(callbacks).then((results) =>
           results.some((r) => r.status === 'fulfilled' && r.value),
