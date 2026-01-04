@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import dts from 'vite-plugin-dts';
-import { copyFileSync } from 'node:fs';
+import { copyFileSync, existsSync } from 'node:fs';
 import { defineConfig, LibraryOptions, LibraryFormats, Plugin } from 'vite';
 import { build, Format } from 'esbuild';
 import { resolve } from 'path';
@@ -33,12 +33,23 @@ function minifyAndUMDPlugin({
            file.fileName.endsWith('.js.map') || 
            file.fileName.endsWith('.css'))
         ) {
+          // Skip worker files in assets directory
+          if (file.fileName.includes('assets/') && file.fileName.includes('worker')) {
+            continue;
+          }
+          
           const isCSS = file.fileName.endsWith('.css');
           const isESM = file.fileName.endsWith('.js.map');
           const inputFilePath = resolve(
             outputOptions.dir!,
             file.fileName,
           ).replace(/\.map$/, '');
+          
+          // Skip if input file doesn't exist
+          if (!existsSync(inputFilePath)) {
+            continue;
+          }
+          
           const baseFileName = file.fileName.replace(
             /(\.cjs|\.js|\.css)(\.map)?$/,
             '',
