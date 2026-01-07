@@ -186,3 +186,126 @@ export function getInactivePeriods(
   }
   return inactivePeriods;
 }
+
+export type VirtualTimelineSegment = {
+  realStart: number;
+  realEnd: number;
+  virtualStart: number;
+  virtualEnd: number;
+  isInactive: boolean;
+  factor: number;
+};
+
+export type VirtualTimeline = {
+  realStart: number;
+  realEnd: number;
+  totalReal: number;
+  totalVirtual: number;
+  segments: VirtualTimelineSegment[];
+  realToVirtual(realTimestamp: number): number;
+  virtualToReal(virtualTimestamp: number): number;
+};
+
+/**
+ * Build a compressed virtual timeline that caps inactive gaps visually.
+ * Event timestamps remain unchanged; this is display-only.
+ */
+export function buildVirtualTimeline(
+  events: eventWithTime[],
+  inactivePeriodThreshold: number,
+  maxInactiveDisplayDuration: number,
+): VirtualTimeline | null {
+  if (!events.length) return null;
+  const realStart = events[0].timestamp;
+  const realEnd = events[events.length - 1].timestamp;
+  if (realStart === realEnd) {
+    return {
+      realStart,
+      realEnd,
+      totalReal: 0,
+      totalVirtual: 0,
+      segments: [],
+      realToVirtual: () => 0,
+      virtualToReal: () => realStart,
+    };
+  }
+
+  const inactivePeriods = getInactivePeriods(events, inactivePeriodThreshold);
+  const segments: VirtualTimelineSegment[] = [];
+  let realCursor = realStart;
+  let virtualCursor = 0;
+
+  const pushSegment = (
+    start: number,
+    end: number,
+    isInactive: boolean,
+    factor: number,
+  ) => {
+    const duration = end - start;
+    const virtualDuration = duration * factor;
+    segments.push({
+      realStart: start,
+      realEnd: end,
+      virtualStart: virtualCursor,
+      virtualEnd: virtualCursor + virtualDuration,
+      isInactive,
+      factor,
+    });
+    realCursor = end;
+    virtualCursor += virtualDuration;
+  };
+
+  for (const [idleStart, idleEnd] of inactivePeriods) {
+    if (idleStart > realCursor) {
+      pushSegment(realCursor, idleStart, false, 1);
+    }
+    if (idleEnd > idleStart) {
+      const idleDuration = idleEnd - idleStart;
+      const compressed = Math.min(idleDuration, maxInactiveDisplayDuration);
+      const factor = compressed / idleDuration;
+      pushSegment(idleStart, idleEnd, true, factor);
+    }
+  }
+
+  if (realCursor < realEnd) {
+    pushSegment(realCursor, realEnd, false, 1);
+  }
+
+  const realToVirtual = (realTimestamp: number) => {
+    if (!segments.length || realTimestamp <= realStart) return 0;
+    for (const segment of segments) {
+      if (realTimestamp <= segment.realEnd) {
+        const clamped = Math.max(segment.realStart, realTimestamp);
+        return (
+          segment.virtualStart + (clamped - segment.realStart) * segment.factor
+        );
+      }
+    }
+    return segments[segments.length - 1].virtualEnd;
+  };
+
+  const virtualToReal = (virtualTimestamp: number) => {
+    if (!segments.length || virtualTimestamp <= 0) return realStart;
+    for (const segment of segments) {
+      if (virtualTimestamp <= segment.virtualEnd) {
+        return (
+          segment.realStart +
+          (virtualTimestamp - segment.virtualStart) / segment.factor
+        );
+      }
+    }
+    return realEnd;
+  };
+
+  return {
+    realStart,
+    realEnd,
+    totalReal: realEnd - realStart,
+    totalVirtual: segments.length
+      ? segments[segments.length - 1].virtualEnd
+      : realEnd - realStart,
+    segments,
+    realToVirtual,
+    virtualToReal,
+  };
+}

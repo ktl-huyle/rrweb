@@ -190,7 +190,7 @@ export class Replayer {
       root: document.body,
       loadTimeout: 0,
       skipInactive: false,
-      inactivePeriodThreshold: 10 * 1000,
+      inactivePeriodThreshold: 5 * 1000,
       showWarning: true,
       showDebug: false,
       blockClass: 'rr-block',
@@ -201,6 +201,8 @@ export class Replayer {
       pauseAnimation: true,
       mouseTail: defaultMouseTailConfig,
       useVirtualDom: true, // Virtual-dom optimization is enabled by default.
+      useCompressedTimeline: false,
+      maxInactiveDisplayDuration: 10 * 1000,
       logger: console,
     };
     this.config = Object.assign({}, defaultConfig, config);

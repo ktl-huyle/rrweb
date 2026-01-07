@@ -12,7 +12,12 @@
     createEventDispatcher,
     afterUpdate,
   } from 'svelte';
-  import { formatTime, getInactivePeriods } from './utils';
+  import {
+    formatTime,
+    getInactivePeriods,
+    buildVirtualTimeline,
+    type VirtualTimeline,
+  } from './utils';
   import Switch from './components/Switch.svelte';
 
   const dispatch = createEventDispatcher();
@@ -26,10 +31,48 @@
   export let tags: Record<string, string> = {};
   export let inactiveColor: string;
 
+  let events = replayer.service.state.context.events;
+  let sessionStart = events[0]?.timestamp ?? 0;
+  const useCompressedTimeline = Boolean(replayer.config.useCompressedTimeline);
+  const maxInactiveDisplayDuration =
+    replayer.config.maxInactiveDisplayDuration ?? 5_000;
+
+  let virtualTimeline: VirtualTimeline | null = null;
+  const rebuildVirtualTimeline = () => {
+    events = replayer.service.state.context.events;
+    sessionStart = events[0]?.timestamp ?? 0;
+    if (!useCompressedTimeline) {
+      virtualTimeline = null;
+      return;
+    }
+    virtualTimeline = buildVirtualTimeline(
+      events,
+      replayer.config.inactivePeriodThreshold,
+      maxInactiveDisplayDuration,
+    );
+  };
+  rebuildVirtualTimeline();
+
+  const toDisplayOffset = (realOffset: number) => {
+    if (!virtualTimeline) return realOffset;
+    const baseVirtual = virtualTimeline.realToVirtual(sessionStart);
+    return (
+      virtualTimeline.realToVirtual(sessionStart + realOffset) - baseVirtual
+    );
+  };
+
+  const toRealOffset = (displayOffset: number) => {
+    if (!virtualTimeline) return displayOffset;
+    const baseVirtual = virtualTimeline.realToVirtual(sessionStart);
+    return (
+      virtualTimeline.virtualToReal(baseVirtual + displayOffset) - sessionStart
+    );
+  };
+
   let currentTime = 0;
-  $: {
-    dispatch('ui-update-current-time', { payload: currentTime });
-  }
+  $: dispatch('ui-update-current-time', { payload: currentTime });
+  let displayCurrentTime = 0;
+  $: displayCurrentTime = toDisplayOffset(currentTime);
   let timer: number | null = null;
   let playerState: 'playing' | 'paused' | 'live';
   $: {
@@ -48,9 +91,13 @@
 
   let meta: playerMetaData;
   $: meta = replayer.getMetaData();
+  let displayTotalTime = 0;
+  $: displayTotalTime = virtualTimeline?.totalVirtual ?? meta.totalTime;
   let percentage: string;
   $: {
-    const percent = Math.min(1, currentTime / meta.totalTime);
+    const percent = displayTotalTime
+      ? Math.min(1, displayCurrentTime / displayTotalTime)
+      : 0;
     percentage = `${100 * percent}%`;
     dispatch('ui-update-progress', { payload: percent });
   }
@@ -61,44 +108,33 @@
   };
 
   /**
-   * Calculate the tag position (percent) to be displayed on the progress bar.
-   * @param startTime - The start time of the session.
-   * @param endTime - The end time of the session.
-   * @param tagTime - The time of the tag.
-   * @returns The position of the tag. unit: percentage
+   * Calculate percentage based on an offset and total duration.
    */
-  function position(startTime: number, endTime: number, tagTime: number) {
-    const sessionDuration = endTime - startTime;
-    const eventDuration = endTime - tagTime;
-    const eventPosition = 100 - (eventDuration / sessionDuration) * 100;
-    return eventPosition.toFixed(2);
+  function positionFromOffset(offset: number, total: number) {
+    if (!total) return '0';
+    return ((offset / total) * 100).toFixed(2);
   }
 
   let customEvents: CustomEvent[];
   $: customEvents = (() => {
     const { context } = replayer.service.state;
-    const totalEvents = context.events.length;
-    const start = context.events[0].timestamp;
-    const end = context.events[totalEvents - 1].timestamp;
-    const customEvents: CustomEvent[] = [];
+    const list: CustomEvent[] = [];
 
-    // loop through all the events and find out custom event.
     context.events.forEach((event) => {
-      /**
-       * we are only interested in custom event and calculate it's position
-       * to place it in player's timeline.
-       */
-      if (event.type === EventType.Custom) {
-        const customEvent = {
-          name: event.data.tag,
-          background: tags[event.data.tag] || 'rgb(73, 80, 246)',
-          position: `${position(start, end, event.timestamp)}%`,
-        };
-        customEvents.push(customEvent);
+      if (event.type !== EventType.Custom) {
+        return;
       }
+      const displayOffset =
+        virtualTimeline?.realToVirtual(event.timestamp) ??
+        event.timestamp - sessionStart;
+      list.push({
+        name: event.data.tag,
+        background: tags[event.data.tag] || 'rgb(73, 80, 246)',
+        position: `${positionFromOffset(displayOffset, displayTotalTime)}%`,
+      });
     });
 
-    return customEvents;
+    return list;
   })();
 
   let inactivePeriods: {
@@ -108,34 +144,41 @@
     width: string;
   }[];
   $: inactivePeriods = (() => {
-    try {
-      const { context } = replayer.service.state;
-      const totalEvents = context.events.length;
-      const start = context.events[0].timestamp;
-      const end = context.events[totalEvents - 1].timestamp;
-      const periods = getInactivePeriods(context.events, replayer.config.inactivePeriodThreshold);
-      // calculate the indicator width.
-      const getWidth = (
-        startTime: number,
-        endTime: number,
-        tagStart: number,
-        tagEnd: number,
-      ) => {
-        const sessionDuration = endTime - startTime;
-        const eventDuration = tagEnd - tagStart;
-        const width = (eventDuration / sessionDuration) * 100;
-        return width.toFixed(2);
-      };
-      return periods.map((period) => ({
-        name: 'inactive period',
-        background: inactiveColor,
-        position: `${position(start, end, period[0])}%`,
-        width: `${getWidth(start, end, period[0], period[1])}%`,
-      }));
-    } catch (e) {
-      // For safety concern, if there is any error, the main function won't be affected.
+    const displayTotal = displayTotalTime;
+    if (!events.length || !displayTotal) {
       return [];
     }
+
+    if (virtualTimeline) {
+      return virtualTimeline.segments
+        .filter((segment) => segment.isInactive)
+        .map((segment) => ({
+          name: 'inactive period',
+          background: inactiveColor,
+          position: `${positionFromOffset(
+            segment.virtualStart,
+            displayTotal,
+          )}%`,
+          width: `${positionFromOffset(
+            segment.virtualEnd - segment.virtualStart,
+            displayTotal,
+          )}%`,
+        }));
+    }
+
+    const periods = getInactivePeriods(
+      events,
+      replayer.config.inactivePeriodThreshold,
+    );
+    return periods.map((period) => ({
+      name: 'inactive period',
+      background: inactiveColor,
+      position: `${positionFromOffset(period[0] - sessionStart, displayTotal)}%`,
+      width: `${positionFromOffset(
+        period[1] - period[0],
+        displayTotal,
+      )}%`,
+    }));
   })();
 
   const loopTimer = () => {
@@ -249,18 +292,24 @@
     } else if (percent > 1) {
       percent = 1;
     }
-    const timeOffset = meta.totalTime * percent;
+    const displayOffset = displayTotalTime * percent;
+    const timeOffset = toRealOffset(displayOffset);
     goto(timeOffset);
   };
 
-  const handleProgressKeydown = (event: KeyboardEvent) => { 
+  const handleProgressKeydown = (event: KeyboardEvent) => {
     if (speedState === 'skipping') {
       return;
     }
     if (event.key === 'ArrowLeft') {
-      goto(currentTime - 5);
+      const displayOffset = Math.max(displayCurrentTime - 5, 0);
+      goto(toRealOffset(displayOffset));
     } else if (event.key === 'ArrowRight') {
-      goto(currentTime + 5);
+      const displayOffset = Math.min(
+        displayCurrentTime + 5,
+        displayTotalTime,
+      );
+      goto(toRealOffset(displayOffset));
     }
   };
 
@@ -283,6 +332,7 @@
   export const triggerUpdateMeta = () => {
     return Promise.resolve().then(() => {
       meta = replayer.getMetaData();
+      rebuildVirtualTimeline();
     });
   };
 
@@ -432,7 +482,7 @@
 {#if showController}
   <div class="rr-controller">
     <div class="rr-timeline">
-      <span class="rr-timeline__time">{formatTime(currentTime)}</span>
+      <span class="rr-timeline__time">{formatTime(displayCurrentTime)}</span>
       <div
         class="rr-progress"
         class:disabled={speedState === 'skipping'}
@@ -462,7 +512,7 @@
 
         <div class="rr-progress__handler" style="left: {percentage}" />
       </div>
-      <span class="rr-timeline__time">{formatTime(meta.totalTime)}</span>
+      <span class="rr-timeline__time">{formatTime(displayTotalTime)}</span>
     </div>
     <div class="rr-controller__btns">
       <button on:click={toggle}>

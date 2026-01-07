@@ -191,6 +191,10 @@ export type playerConfig = {
       };
   unpackFn?: UnpackFn;
   useVirtualDom: boolean;
+  // Display-only compressed timeline; does not change recorded timestamps.
+  useCompressedTimeline?: boolean;
+  // Max duration (ms) to display for any inactive gap when compressing.
+  maxInactiveDisplayDuration?: number;
   logger: {
     log: (...args: Parameters<typeof console.log>) => void;
     warn: (...args: Parameters<typeof console.warn>) => void;
