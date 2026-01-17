@@ -31,6 +31,10 @@ import {
   absolutifyURLs,
   markCssSplits,
 } from './utils';
+import {
+  getSnapshotEnhancements,
+  type CssImagesConfig,
+} from './enhancements';
 import dom from '@rrweb/utils';
 
 let _id = 1;
@@ -66,6 +70,10 @@ let canvasCtx: CanvasRenderingContext2D | null;
 const SRCSET_NOT_SPACES = /^[^ \t\n\r\u000c]+/; // Don't use \s, to avoid matching non-breaking space
 // eslint-disable-next-line no-control-regex
 const SRCSET_COMMAS_OR_SPACES = /^[, \t\n\r\u000c]+/;
+const CSS_URL_REGEX = /url\(\s*(?:'([^']+)'|"([^"]+)"|([^'")\s]+))\s*\)/gi;
+const CSS_IMAGE_DECL_REGEX =
+  /(background(?:-image)?|border-image(?:-source)?|list-style(?:-image)?|content)\s*:\s*([^;{}]*url\([^;{}]*\))/gi;
+const cssImageInlineCache = new Map<string, string>();
 function getAbsoluteSrcsetString(doc: Document, attributeValue: string) {
   /*
     run absoluteToDoc over every url in the srcset
@@ -148,6 +156,169 @@ export function absoluteToDoc(doc: Document, attributeValue: string): string {
   }
 
   return getHref(doc, attributeValue);
+}
+
+type CssUrlMatch = {
+  url: string;
+  start: number;
+  end: number;
+};
+
+function shouldSkipCssImageUrl(url: string): boolean {
+  const normalized = url.trim().toLowerCase();
+  return (
+    normalized === '' ||
+    normalized.startsWith('data:') ||
+    normalized.startsWith('blob:') ||
+    normalized.startsWith('javascript:') ||
+    normalized.startsWith('#') ||
+    normalized.startsWith('about:')
+  );
+}
+
+function getCssImageUrlMatches(cssText: string): CssUrlMatch[] {
+  const matches: CssUrlMatch[] = [];
+  CSS_IMAGE_DECL_REGEX.lastIndex = 0;
+  let declMatch: RegExpExecArray | null;
+  while ((declMatch = CSS_IMAGE_DECL_REGEX.exec(cssText)) !== null) {
+    const value = declMatch[2];
+    const valueStart = declMatch.index + declMatch[0].indexOf(value);
+    CSS_URL_REGEX.lastIndex = 0;
+    let urlMatch: RegExpExecArray | null;
+    while ((urlMatch = CSS_URL_REGEX.exec(value)) !== null) {
+      const rawUrl = (urlMatch[1] || urlMatch[2] || urlMatch[3] || '').trim();
+      if (!rawUrl) continue;
+      matches.push({
+        url: rawUrl,
+        start: valueStart + urlMatch.index,
+        end: valueStart + urlMatch.index + urlMatch[0].length,
+      });
+    }
+  }
+  return matches;
+}
+
+function arrayBufferToBase64(
+  buffer: ArrayBuffer,
+  btoaImpl: (data: string) => string,
+): string {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoaImpl(binary);
+}
+
+function inlineCssImageUrls(
+  cssText: string,
+  doc: Document,
+  onInline: (updatedCss: string) => void,
+): Promise<boolean> | null {
+  const cssConfig: CssImagesConfig = getSnapshotEnhancements().cssImages;
+  if (!cssConfig.enabled) return null;
+  const fetchImpl =
+    doc.defaultView?.fetch || (typeof fetch === 'function' ? fetch : null);
+  const btoaImpl =
+    doc.defaultView?.btoa || (typeof btoa === 'function' ? btoa : null);
+  if (!fetchImpl || !btoaImpl) {
+    return null;
+  }
+  const matches = getCssImageUrlMatches(cssText);
+  if (!matches.length) return null;
+
+  // normalize URLs and dedupe work
+  const normalizedMatches: CssUrlMatch[] = [];
+  for (const match of matches) {
+    const absoluteUrl = absoluteToDoc(doc, match.url);
+    if (shouldSkipCssImageUrl(absoluteUrl)) continue;
+    normalizedMatches.push({ ...match, url: absoluteUrl });
+  }
+  if (!normalizedMatches.length) return null;
+
+  const replacements: Array<CssUrlMatch & { dataUrl: string }> = [];
+  let totalBytes = 0;
+
+  return (async () => {
+    for (const match of normalizedMatches) {
+      if (totalBytes >= cssConfig.maxTotalBytes) break;
+      const cached = cssImageInlineCache.get(match.url);
+      if (cached) {
+        replacements.push({ ...match, dataUrl: cached });
+        continue;
+      }
+
+      const controller =
+        typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timeoutId = controller
+        ? setTimeout(() => controller.abort(), cssConfig.fetchTimeoutMs)
+        : null;
+      try {
+        const response = await fetchImpl(match.url, {
+          // cache-only to avoid new network requests; will throw if not cached or cross-origin
+          cache: 'only-if-cached',
+          mode: 'same-origin',
+          credentials: 'include',
+          signal: controller ? controller.signal : undefined,
+        });
+        if (!response.ok) continue;
+        const declaredLength = response.headers.get('content-length');
+        const parsedLength = declaredLength ? parseInt(declaredLength, 10) : 0;
+        if (
+          parsedLength &&
+          (parsedLength > cssConfig.maxBytesPerImage ||
+            totalBytes + parsedLength > cssConfig.maxTotalBytes)
+        ) {
+          continue;
+        }
+        const buffer = await response.arrayBuffer();
+        if (!buffer.byteLength) continue;
+        if (buffer.byteLength > cssConfig.maxBytesPerImage) continue;
+        if (totalBytes + buffer.byteLength > cssConfig.maxTotalBytes)
+          break;
+
+        const contentType =
+          response.headers.get('content-type')?.split(';')[0] ||
+          'application/octet-stream';
+        const dataUrl = `data:${contentType};base64,${arrayBufferToBase64(
+          buffer,
+          btoaImpl,
+        )}`;
+        cssImageInlineCache.set(match.url, dataUrl);
+        totalBytes += buffer.byteLength;
+        replacements.push({ ...match, dataUrl });
+      } catch (e) {
+        // ignore failures
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
+    }
+
+    if (!replacements.length) return false;
+    const sorted = replacements.sort((a, b) => a.start - b.start);
+    let cursor = 0;
+    let result = '';
+    for (const rep of sorted) {
+      result += cssText.slice(cursor, rep.start);
+      result += `url("${rep.dataUrl}")`;
+      cursor = rep.end;
+    }
+    result += cssText.slice(cursor);
+    if (replacements.length) {
+      if (cssConfig.log && typeof console !== 'undefined' && console.info) {
+        console.info(
+          `[rrweb] inlined ${replacements.length} css image(s) (${totalBytes} bytes)`,
+        );
+      }
+      onInline(result);
+      return true;
+    }
+    return false;
+  })().catch(() => {
+    // swallow unexpected async errors
+    return false;
+  });
 }
 
 function isSVGElement(el: Element): boolean {
@@ -399,6 +570,7 @@ function serializeNode(
     inlineImages: boolean;
     recordCanvas: boolean;
     keepIframeSrcFn: KeepIframeSrcFn;
+    cssImageInlineCallbacks?: Promise<boolean>[];
     /**
      * `newlyAddedElement: true` skips scrollTop and scrollLeft check
      */
@@ -420,6 +592,7 @@ function serializeNode(
     inlineImages,
     recordCanvas,
     keepIframeSrcFn,
+    cssImageInlineCallbacks,
     newlyAddedElement = false,
     cssCaptured = false,
   } = options;
@@ -459,6 +632,7 @@ function serializeNode(
         inlineImages,
         recordCanvas,
         keepIframeSrcFn,
+        cssImageInlineCallbacks,
         newlyAddedElement,
         rootId,
       });
@@ -549,6 +723,7 @@ function serializeElementNode(
     inlineImages: boolean;
     recordCanvas: boolean;
     keepIframeSrcFn: KeepIframeSrcFn;
+    cssImageInlineCallbacks?: Promise<boolean>[];
     /**
      * `newlyAddedElement: true` skips scrollTop and scrollLeft check
      */
@@ -567,6 +742,7 @@ function serializeElementNode(
     inlineImages,
     recordCanvas,
     keepIframeSrcFn,
+    cssImageInlineCallbacks,
     newlyAddedElement = false,
     rootId,
   } = options;
@@ -585,6 +761,12 @@ function serializeElementNode(
       );
     }
   }
+  if (inlineStylesheet && typeof attributes.style === 'string') {
+    const task = inlineCssImageUrls(attributes.style, doc, (inlinedCss) => {
+      attributes.style = inlinedCss;
+    });
+    if (task && cssImageInlineCallbacks) cssImageInlineCallbacks.push(task);
+  }
   // remote css
   if (tagName === 'link' && inlineStylesheet) {
     //TODO: maybe replace this `.styleSheets` with original one
@@ -599,6 +781,10 @@ function serializeElementNode(
       delete attributes.rel;
       delete attributes.href;
       attributes._cssText = cssText;
+      const task = inlineCssImageUrls(cssText, doc, (inlinedCss) => {
+        attributes._cssText = inlinedCss;
+      });
+      if (task && cssImageInlineCallbacks) cssImageInlineCallbacks.push(task);
     }
   }
   if (tagName === 'style' && (n as HTMLStyleElement).sheet) {
@@ -610,6 +796,12 @@ function serializeElementNode(
         cssText = markCssSplits(cssText, n as HTMLStyleElement);
       }
       attributes._cssText = cssText;
+      if (inlineStylesheet) {
+        const task = inlineCssImageUrls(cssText, doc, (inlinedCss) => {
+          attributes._cssText = inlinedCss;
+        });
+        if (task && cssImageInlineCallbacks) cssImageInlineCallbacks.push(task);
+      }
     }
   }
   // form fields
@@ -941,6 +1133,7 @@ export function serializeNodeWithId(
     inlineImages?: boolean;
     recordCanvas?: boolean;
     preserveWhiteSpace?: boolean;
+    cssImageInlineCallbacks?: Promise<boolean>[];
     onSerialize?: (n: Node) => unknown;
     onIframeLoad?: (
       iframeNode: HTMLIFrameElement,
@@ -971,6 +1164,7 @@ export function serializeNodeWithId(
     dataURLOptions = {},
     inlineImages = false,
     recordCanvas = false,
+    cssImageInlineCallbacks,
     onSerialize,
     onIframeLoad,
     iframeLoadTimeout = 5000,
@@ -1007,6 +1201,7 @@ export function serializeNodeWithId(
     dataURLOptions,
     inlineImages,
     recordCanvas,
+    cssImageInlineCallbacks,
     keepIframeSrcFn,
     newlyAddedElement,
     cssCaptured,
@@ -1090,6 +1285,7 @@ export function serializeNodeWithId(
       stylesheetLoadTimeout,
       keepIframeSrcFn,
       cssCaptured: false,
+      cssImageInlineCallbacks,
     };
 
     if (
@@ -1251,6 +1447,7 @@ function snapshot(
     inlineImages?: boolean;
     recordCanvas?: boolean;
     preserveWhiteSpace?: boolean;
+    cssImageInlineCallbacks?: Promise<boolean>[];
     onSerialize?: (n: Node) => unknown;
     onIframeLoad?: (
       iframeNode: HTMLIFrameElement,
@@ -1280,6 +1477,7 @@ function snapshot(
     slimDOM = false,
     dataURLOptions,
     preserveWhiteSpace,
+    cssImageInlineCallbacks,
     onSerialize,
     onIframeLoad,
     iframeLoadTimeout,
@@ -1331,6 +1529,7 @@ function snapshot(
     inlineImages,
     recordCanvas,
     preserveWhiteSpace,
+    cssImageInlineCallbacks,
     onSerialize,
     onIframeLoad,
     iframeLoadTimeout,
